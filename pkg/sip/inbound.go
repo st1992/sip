@@ -18,6 +18,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -423,6 +424,14 @@ func (c *inboundCall) runMediaConn(offerData []byte, conf *config.Config) (answe
 	c.mon.SDPSize(len(offerData), true)
 	c.log.Debugw("SDP offer", "sdp", string(offerData))
 
+	offerSDP := string(offerData)
+
+	re := regexp.MustCompile(`b=TIAS:\d+\r\n`)
+	offerSDP = re.ReplaceAllString(offerSDP, "")
+
+	// Convert the modified SDP back to []byte
+	modifiedOfferData := []byte(offerSDP)
+
 	mp, err := NewMediaPort(c.log, c.mon, &MediaConfig{
 		IP:                  c.s.signalingIp,
 		Ports:               conf.RTPPort,
@@ -436,7 +445,7 @@ func (c *inboundCall) runMediaConn(offerData []byte, conf *config.Config) (answe
 	c.media.EnableTimeout(false) // enabled once we accept the call
 	c.media.SetDTMFAudio(conf.AudioDTMF)
 
-	answerData, mconf, err := mp.SetOffer(offerData)
+	answerData, mconf, err := mp.SetOffer(modifiedOfferData)
 	if err != nil {
 		return nil, err
 	}
