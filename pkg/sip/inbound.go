@@ -26,8 +26,10 @@ import (
 
 	"github.com/emiago/sipgo/sip"
 	"github.com/icholy/digest"
+
 	"github.com/livekit/protocol/livekit"
 	"github.com/livekit/protocol/logger"
+	"github.com/livekit/protocol/rpc"
 	lksip "github.com/livekit/protocol/sip"
 	"github.com/livekit/protocol/tracer"
 	"github.com/livekit/psrpc"
@@ -212,7 +214,7 @@ func (s *Server) onBye(req *sip.Request, tx sip.ServerTransaction) {
 	if c != nil {
 		c.log.Infow("BYE")
 		c.cc.AcceptBye(req, tx)
-		c.Close()
+		_ = c.Close()
 		return
 	}
 	ok := false
@@ -273,7 +275,14 @@ type inboundCall struct {
 	done        atomic.Bool
 }
 
-func (s *Server) newInboundCall(log logger.Logger, mon *stats.CallMonitor, cc *sipInbound, src string, extra map[string]string) *inboundCall {
+func (s *Server) newInboundCall(
+	log logger.Logger,
+	mon *stats.CallMonitor,
+	cc *sipInbound,
+	src string,
+	extra map[string]string,
+) *inboundCall {
+
 	extra = HeadersToAttrs(extra, nil, cc)
 	c := &inboundCall{
 		s:          s,
@@ -345,7 +354,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 	}
 
 	// We need to start media first, otherwise we won't be able to send audio prompts to the caller, or receive DTMF.
-	answerData, err := c.runMediaConn(req.Body(), conf)
+	answerData, err := c.runMediaConn(req.Body(), conf, disp.EnabledFeatures)
 	if err != nil {
 		c.log.Errorw("Cannot start media", err)
 		c.cc.RespondAndDrop(sip.StatusInternalServerError, "")
@@ -420,7 +429,7 @@ func (c *inboundCall) handleInvite(ctx context.Context, req *sip.Request, trunkI
 	}
 }
 
-func (c *inboundCall) runMediaConn(offerData []byte, conf *config.Config) (answerData []byte, _ error) {
+func (c *inboundCall) runMediaConn(offerData []byte, conf *config.Config, features []rpc.SIPFeature) (answerData []byte, _ error) {
 	c.mon.SDPSize(len(offerData), true)
 	c.log.Debugw("SDP offer", "sdp", string(offerData))
 
@@ -452,6 +461,7 @@ func (c *inboundCall) runMediaConn(offerData []byte, conf *config.Config) (answe
 	c.mon.SDPSize(len(answerData), false)
 	c.log.Debugw("SDP answer", "sdp", string(answerData))
 
+	mconf.Processor = c.s.handler.GetMediaProcessor(features)
 	if err = c.media.SetConfig(mconf); err != nil {
 		return nil, err
 	}
@@ -596,9 +606,7 @@ func (c *inboundCall) close(error bool, status CallStatus, reason string) {
 	if !c.done.CompareAndSwap(false, true) {
 		return
 	}
-	if status != "" {
-		c.setStatus(status)
-	}
+	c.setStatus(status)
 	c.mon.CallTerminate(reason)
 	if error {
 		c.log.Warnw("Closing inbound call with error", nil, "reason", reason)
@@ -646,6 +654,10 @@ func (c *inboundCall) closeMedia() {
 }
 
 func (c *inboundCall) setStatus(v CallStatus) {
+	attr := v.Attribute()
+	if attr == "" {
+		return
+	}
 	if c.lkRoom == nil {
 		return
 	}
@@ -655,7 +667,7 @@ func (c *inboundCall) setStatus(v CallStatus) {
 	}
 
 	r.LocalParticipant.SetAttributes(map[string]string{
-		AttrSIPCallStatus: string(v),
+		AttrSIPCallStatus: attr,
 	})
 }
 
@@ -669,7 +681,7 @@ func (c *inboundCall) createLiveKitParticipant(ctx context.Context, rconf RoomCo
 	for k, v := range c.extraAttrs {
 		partConf.Attributes[k] = v
 	}
-	partConf.Attributes[AttrSIPCallStatus] = string(CallActive)
+	partConf.Attributes[AttrSIPCallStatus] = CallActive.Attribute()
 	c.forwardDTMF.Store(true)
 	select {
 	case <-ctx.Done():
@@ -753,6 +765,8 @@ func (c *inboundCall) transferCall(ctx context.Context, transferTo string) error
 		return err
 	}
 
+	c.log.Infow("inbound call tranferred", "transferTo", transferTo)
+
 	// This is needed to actually terminate the session before a media timeout
 	c.Close()
 
@@ -767,7 +781,7 @@ func (s *Server) newInbound(id LocalTag, invite *sip.Request, inviteTx sip.Serve
 		invite:    invite,
 		inviteTx:  inviteTx,
 		cancelled: make(chan struct{}),
-		referDone: make(chan error, 1),
+		referDone: make(chan error), // Do not buffer the channel to avoid reading a result for an old request
 	}
 	c.from, _ = invite.From()
 	if c.from != nil {
@@ -1103,14 +1117,14 @@ func (c *sipInbound) handleNotify(req *sip.Request, tx sip.ServerTransaction) er
 			// Success
 			select {
 			case c.referDone <- nil:
-			default:
+			case <-time.After(notifyAckTimeout):
 			}
 		default:
 			// Failure
 			select {
 			// TODO be more specific in the reported error
 			case c.referDone <- psrpc.NewErrorf(psrpc.Canceled, "call transfer failed"):
-			default:
+			case <-time.After(notifyAckTimeout):
 			}
 		}
 	}
