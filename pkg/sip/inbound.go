@@ -307,7 +307,6 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 			info.EndedAtNs = time.Now().UnixNano()
 		})
 	}()
-	s.mon.InviteReqRaw(stats.Inbound)
 
 	src, err := netip.ParseAddrPort(req.Source())
 	if err != nil {
@@ -316,6 +315,12 @@ func (s *Server) processInvite(req *sip.Request, tx sip.ServerTransaction) (retE
 		return psrpc.NewError(psrpc.MalformedRequest, errors.Wrap(err, "cannot parse source IP"))
 	}
 	tr := callTransportFromReq(req)
+
+	if IsSiprecInvite(req) {
+		return s.processSiprecInvite(req, tx)
+	}
+
+	s.mon.InviteReqRaw(stats.Inbound)
 
 	cc, err := s.newInbound(req, tx, src)
 	if err != nil {
@@ -493,6 +498,9 @@ func (s *Server) onAck(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 	c := s.byLocalTag[tag]
 	s.cmu.RUnlock()
 	if c == nil {
+		if s.siprecSessions != nil {
+			s.handleSiprecAck(req)
+		}
 		return
 	}
 	c.log().Infow("ACK from remote")
@@ -529,6 +537,9 @@ func (s *Server) onBye(log *slog.Logger, req *sip.Request, tx sip.ServerTransact
 			"reason-raw", rawReason,
 		)
 		c.Bye(reason)
+		return
+	}
+	if s.siprecSessions != nil && s.handleSiprecBye(req, tx) {
 		return
 	}
 	ok := false

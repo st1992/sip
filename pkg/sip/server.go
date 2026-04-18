@@ -58,10 +58,12 @@ var (
 )
 
 type CallInfo struct {
-	TrunkID string
-	Call    *rpc.SIPCall
-	Pin     string
-	NoPin   bool
+	TrunkID     string
+	Call        *rpc.SIPCall
+	Pin         string
+	NoPin       bool
+	IsSiprec    bool
+	SiprecLabel string
 }
 
 type AuthResult int
@@ -158,6 +160,8 @@ type Server struct {
 
 	cli *Client // optional, for outbound reinvite handling
 
+	siprecSessions *SiprecSessionStore
+
 	res mediaRes
 }
 
@@ -195,6 +199,7 @@ func NewServer(region string, conf *config.Config, log logger.Logger, mon *stats
 		getRoom:            DefaultGetRoomFunc,
 		byLocalTag:         make(map[LocalTag]*inboundCall),
 		provisionalInvites: expirable.NewLRU[[2]string, LocalTag](maxCallCache, nil, callCacheTTL),
+		siprecSessions:     NewSiprecSessionStore(log),
 	}
 	for _, option := range options {
 		option(s)
@@ -349,6 +354,9 @@ func (s *Server) Stop() {
 	s.cmu.Unlock()
 	for _, c := range calls {
 		_ = c.Close()
+	}
+	if s.siprecSessions != nil {
+		s.siprecSessions.Clear()
 	}
 	if s.sipSrv != nil {
 		_ = s.sipSrv.Close()
