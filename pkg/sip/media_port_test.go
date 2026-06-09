@@ -23,6 +23,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -165,30 +166,30 @@ func newIP(v string) netip.Addr {
 }
 
 func TestMediaPort(t *testing.T) {
-	codecs := msdk.Codecs()
-	disableAll := func() {
-		for _, codec := range codecs {
-			msdk.CodecSetEnabled(codec.Info().SDPName, false)
-		}
+	// Main resampler has unpredictable (although tiny) output delay
+	// and other randomness in the generated samples.
+	// Enable a predictable resampler to avoid flaky tests.
+	prevOpts := msdk.DefaultResampleOptions
+	msdk.DefaultResampleOptions = []msdk.ResampleOption{
+		msdk.WithPredictableResample(true),
 	}
 	defer func() {
-		for _, codec := range codecs {
-			info := codec.Info()
-			msdk.CodecSetEnabled(info.SDPName, !info.Disabled)
-		}
+		msdk.DefaultResampleOptions = prevOpts
 	}()
-	for _, codec := range codecs {
+	codecList := msdk.Codecs()
+	for _, codec := range codecList {
 		info := codec.Info()
-		t.Run(info.SDPName, func(t *testing.T) {
-			disableAll()
-			msdk.CodecSetEnabled(info.SDPName, true)
+		tname := strings.ReplaceAll(info.SDPName, "/", "-")
+		t.Run(tname, func(t *testing.T) {
+			codecs := msdk.NewCodecSet()
+			codecs.SetEnabled(info.SDPName, true)
 
 			sub := strings.SplitN(info.SDPName, "/", 2)
-			name := sub[0]
+			codecName := sub[0]
 			nativeRateSDP, err := strconv.Atoi(sub[1])
 			nativeRate := nativeRateSDP
 			require.NoError(t, err)
-			switch name {
+			switch codecName {
 			case "telephone-event":
 				t.SkipNow()
 			case "G722":
@@ -217,128 +218,184 @@ func TestMediaPort(t *testing.T) {
 						port1 = 10000
 						port2 = 20000
 					)
-					m1, err := NewMediaPortWith(1, log.WithName("one"), newTestCallMonitor(t), c1, &MediaOptions{
+					testRate := tconf.Rate
+					bobToAliceNoResample := testRate == 8000
+
+					alicePort, err := NewMediaPortWith(1, log.WithName("Alice"), newTestCallMonitor(t), c1, &MediaOptions{
 						IP:              newIP(ip1),
 						Ports:           rtcconfig.PortRange{Start: port1},
-						NoInputResample: true,
-					}, tconf.Rate)
+						NoInputResample: bobToAliceNoResample,
+					}, testRate)
 					require.NoError(t, err)
-					defer m1.Close()
+					defer alicePort.Close()
 
-					m2, err := NewMediaPortWith(2, log.WithName("two"), newTestCallMonitor(t), c2, &MediaOptions{
+					bobPort, err := NewMediaPortWith(2, log.WithName("Bob"), newTestCallMonitor(t), c2, &MediaOptions{
 						IP:    newIP(ip2),
 						Ports: rtcconfig.PortRange{Start: port2},
-					}, tconf.Rate)
+					}, testRate)
 					require.NoError(t, err)
-					defer m2.Close()
+					defer bobPort.Close()
 
-					offer, err := m1.NewOffer(tconf.Encrypted)
+					// Alice sends an offer to Bob
+
+					offer, err := alicePort.NewOffer(codecs, tconf.Encrypted)
 					require.NoError(t, err)
 					offerData, err := offer.SDP.Marshal()
 					require.NoError(t, err)
 
 					t.Logf("SDP offer:\n%s", string(offerData))
 
-					answer, conf, err := m2.SetOffer(offerData, tconf.Encrypted)
+					answer, bobConf, err := bobPort.SetOffer(offerData, codecs, tconf.Encrypted)
 					require.NoError(t, err)
 					answerData, err := answer.SDP.Marshal()
 					require.NoError(t, err)
 
 					t.Logf("SDP answer:\n%s", string(answerData))
 
-					mc, _, err := m1.SetAnswer(offer, answerData, tconf.Encrypted)
+					aliceConf, _, err := alicePort.SetAnswer(offer, answerData, codecs, tconf.Encrypted)
 					require.NoError(t, err)
 
-					err = m1.SetConfig(mc)
+					err = alicePort.SetConfig(aliceConf)
 					require.NoError(t, err)
 
-					err = m2.SetConfig(conf)
+					err = bobPort.SetConfig(bobConf)
 					require.NoError(t, err)
 
-					audio1 := m1.Config().Audio
-					audio2 := m2.Config().Audio
-					codec1 := audio1.Codec
-					codec2 := audio2.Codec
-					require.Equal(t, info.SDPName, codec1.Info().SDPName)
-					require.Equal(t, info.SDPName, codec2.Info().SDPName)
+					aliceAudio := alicePort.Config().Audio
+					bobAudio := bobPort.Config().Audio
 
-					var buf1 msdk.PCM16Sample
-					bw1 := msdk.NewPCM16BufferWriter(&buf1, codec1.Info().SampleRate)
-					m1.WriteAudioTo(bw1)
+					aliceCodec := aliceAudio.Codec
+					bobCodec := bobAudio.Codec
 
-					var buf2 msdk.PCM16Sample
-					bw2 := msdk.NewPCM16BufferWriter(&buf2, tconf.Rate)
-					m2.WriteAudioTo(bw2)
+					require.Equal(t, info.SDPName, aliceCodec.Info().SDPName)
+					require.Equal(t, info.SDPName, bobCodec.Info().SDPName)
 
-					w1 := m1.GetAudioWriter()
-					w2 := m2.GetAudioWriter()
+					// Buffers should match the rate of the samples we write.
 
-					packetSize := uint32(tconf.Rate / int(time.Second/rtp.DefFrameDur))
-					sample1 := make(msdk.PCM16Sample, packetSize)
-					sample2 := make(msdk.PCM16Sample, packetSize)
+					var aliceRecvBuf msdk.PCM16Sample
+					aliceHandler := msdk.NewPCM16BufferWriter(&aliceRecvBuf, testRate)
+					alicePort.WriteAudioTo(aliceHandler)
+
+					var bobRecvBuf msdk.PCM16Sample
+					bobHandler := msdk.NewPCM16BufferWriter(&bobRecvBuf, testRate)
+					bobPort.WriteAudioTo(bobHandler)
+
+					aliceToBob := alicePort.GetAudioWriter()
+					bobToAlice := bobPort.GetAudioWriter()
+
+					aliceToBobWriteChain := aliceToBob.String()
+					bobToAliceWriteChain := bobToAlice.String()
+
+					bobToAliceHandleChain := PrintAudioInWriter(alicePort)
+					aliceToBobHandleChain := PrintAudioInWriter(bobPort)
+
+					t.Log("A -> B (write)", aliceToBobWriteChain)
+					t.Log("B -> A (write)", bobToAliceWriteChain)
+
+					t.Log("B -> A (handle)", bobToAliceHandleChain)
+					t.Log("A -> B (handle)", aliceToBobHandleChain)
+
+					t.Log("resample", !bobToAliceNoResample)
+
+					packetSize := testRate / int(time.Second/rtp.DefFrameDur)
+					aliceToBobSamples := make(msdk.PCM16Sample, packetSize)
+					bobToAliceSamples := make(msdk.PCM16Sample, packetSize)
+					const (
+						amp1 = 10000
+						amp2 = 5000
+						freq = 10
+					)
 					for i := range packetSize {
-						sample1[i] = +5116
-						sample2[i] = -5116
+						aliceToBobSamples[i] = int16(amp1 * math.Sin(freq*2*math.Pi*float64(i)/float64(packetSize)))
+						bobToAliceSamples[i] = int16(amp2 * math.Sin(freq*2*math.Pi*float64(i)/float64(packetSize)))
 					}
 
-					writes1 := 1
-					writes2 := 1
+					aliceToBobWrites := 1
+					bobToAliceWrites := 1
 					if tconf.Rate == nativeRate {
 						expChainBase := fmt.Sprintf("Switch(%d) -> LatencyEntry -> %s(encode) -> ByteEncoder(%d) -> StatsWriter(%s/%d) -> LatencyExit",
-							nativeRate, name, nativeRate, name, nativeRateSDP)
-						require.Equal(t, fmt.Sprintf("%s -> RTPWriteStream(%s:%d)", expChainBase, ip2, port2), w1.String())
-						require.Equal(t, fmt.Sprintf("%s -> RTPWriteStream(%s:%d)", expChainBase, ip1, port1), w2.String())
+							nativeRate, codecName, nativeRate, codecName, nativeRateSDP)
+						require.Equal(t, fmt.Sprintf("%s -> RTPWriteStream(%s:%d)", expChainBase, ip2, port2), aliceToBobWriteChain)
+						require.Equal(t, fmt.Sprintf("%s -> RTPWriteStream(%s:%d)", expChainBase, ip1, port1), bobToAliceWriteChain)
 
-						expChainBase = fmt.Sprintf("SilenceFiller(25) -> RTP(%%d) -> ByteDecoder -> %s(decode) -> LatencyExit -> Switch(%d) -> Buffer(%d)", name, nativeRate, nativeRate)
-						require.Equal(t, fmt.Sprintf(expChainBase, audio1.Type), PrintAudioInWriter(m1))
-						require.Equal(t, fmt.Sprintf(expChainBase, audio2.Type), PrintAudioInWriter(m2))
+						expChainBase = fmt.Sprintf("SilenceFiller(25) -> RTP(%%d) -> ByteDecoder -> %s(decode) -> LatencyExit -> Switch(%d) -> Buffer(%d)", codecName, nativeRate, nativeRate)
+						require.Equal(t, fmt.Sprintf(expChainBase, aliceAudio.Type), bobToAliceHandleChain)
+						require.Equal(t, fmt.Sprintf(expChainBase, bobAudio.Type), aliceToBobHandleChain)
 					} else {
 						expChain := fmt.Sprintf("Switch(48000) -> Resample(48000->%d) -> LatencyEntry -> %s(encode) -> ByteEncoder(%d) -> StatsWriter(%s/%d) -> LatencyExit -> SRTPWriteStream",
-							nativeRate, name, nativeRate, name, nativeRateSDP)
-						require.Equal(t, expChain, w1.String())
-						require.Equal(t, expChain, w2.String())
+							nativeRate, codecName, nativeRate, codecName, nativeRateSDP)
+						require.Equal(t, expChain, aliceToBobWriteChain)
+						require.Equal(t, expChain, bobToAliceWriteChain)
 
 						// This side does not resample the received audio, it uses sample rate of the RTP source.
-						expChain1 := fmt.Sprintf("SilenceFiller(25) -> RTP(%d) -> ByteDecoder -> %s(decode) -> LatencyExit -> Switch(%d) -> Buffer(%d)", audio1.Type, name, nativeRate, nativeRate)
+						var expChainAlice string
+						if bobToAliceNoResample {
+							expChainAlice = fmt.Sprintf("SilenceFiller(25) -> RTP(%d) -> ByteDecoder -> %s(decode) -> LatencyExit -> Switch(%d) -> Buffer(%d)", aliceAudio.Type, codecName, nativeRate, nativeRate)
+						} else {
+							expChainAlice = fmt.Sprintf("SilenceFiller(25) -> RTP(%d) -> ByteDecoder -> %s(decode) -> Resample(%d->48000) -> LatencyExit -> Switch(48000) -> Buffer(48000)", aliceAudio.Type, codecName, nativeRate)
+						}
+
 						// This side resamples the received audio to the expected sample rate.
-						expChain2 := fmt.Sprintf("SilenceFiller(25) -> RTP(%d) -> ByteDecoder -> %s(decode) -> Resample(%d->48000) -> LatencyExit -> Switch(48000) -> Buffer(48000)", audio2.Type, name, nativeRate)
-						require.Equal(t, expChain1, PrintAudioInWriter(m1))
-						require.Equal(t, expChain2, PrintAudioInWriter(m2))
+						expChainBob := fmt.Sprintf("SilenceFiller(25) -> RTP(%d) -> ByteDecoder -> %s(decode) -> Resample(%d->48000) -> LatencyExit -> Switch(48000) -> Buffer(48000)", bobAudio.Type, codecName, nativeRate)
 
-						// resampler will buffer a few frames
-						writes1 += 2
-						writes2 += 2
-						// a few more because of higher resample quality required
-						if nativeRate == 8000 {
-							writes1 += 3
-							writes2 += 5
-						}
-						if strings.HasPrefix(info.SDPName, "G722/") {
-							writes2 += 1
-						}
+						require.Equal(t, expChainAlice, bobToAliceHandleChain)
+						require.Equal(t, expChainBob, aliceToBobHandleChain)
 					}
+					// Ramp-up time for the codec.
+					// Some codecs have "inertia" and cannot immediately represent the sound exactly.
+					// This is shy we write signal multiple times to give it some time to adapt.
+					// We will also cut the ramp-up part from the destination buffer before comparing.
+					// This variable is in full frames, so that we clearly see where frames start to calculate the offset below.
+					rampUpFrames := 0
+					// Some codecs have an extra buffering internally, and we have to offset the compared sample
+					// by this number of sampled values.
+					offsetSamples := 0
 
-					for range writes1 {
-						err = w1.WriteSample(sample1)
-						require.NoError(t, err)
+					switch codecName {
+					case "G722":
+						rampUpFrames += 1
+						offsetSamples += 22
+					case "AMR-WB":
+						rampUpFrames += 1
+						offsetSamples += 14 + 16
 					}
-					for range writes2 {
-						err = w2.WriteSample(sample2)
-						require.NoError(t, err)
-					}
+					aliceToBobWrites += rampUpFrames
+					bobToAliceWrites += rampUpFrames
+					discard := rampUpFrames * packetSize
+
+					resampleMult := testRate / nativeRate
+					offsetSamples *= resampleMult
+
+					var wg sync.WaitGroup
+					wg.Add(2)
+					go func() {
+						defer wg.Done()
+						for range aliceToBobWrites {
+							err := aliceToBob.WriteSample(aliceToBobSamples)
+							require.NoError(t, err)
+						}
+					}()
+					go func() {
+						defer wg.Done()
+						for range bobToAliceWrites {
+							err := bobToAlice.WriteSample(bobToAliceSamples)
+							require.NoError(t, err)
+						}
+					}()
+					wg.Wait()
 
 					time.Sleep(time.Second / 4)
 
 					// Cut buffers earlier, otherwise we might get extra samples
 					// that we added to push resampler forward.
-					bw1.Close()
-					bw2.Close()
+					aliceHandler.Close()
+					bobHandler.Close()
 
-					m1.Close()
-					m2.Close()
+					alicePort.Close()
+					bobPort.Close()
 
-					checkPCM(t, sample1, buf2)
-					checkPCM(t, sample2, buf1)
+					checkPCM(t, "A -> B", aliceToBobSamples[:packetSize-offsetSamples], bobRecvBuf[discard+offsetSamples:])
+					checkPCM(t, "B -> A", bobToAliceSamples[:packetSize-offsetSamples], aliceRecvBuf[discard+offsetSamples:])
 				})
 			}
 		})
@@ -346,27 +403,49 @@ func TestMediaPort(t *testing.T) {
 
 }
 
-func checkPCM(t testing.TB, exp, got msdk.PCM16Sample) {
+func checkPCM(t testing.TB, name string, exp, got msdk.PCM16Sample) {
 	t.Helper()
 	require.Equal(t, len(exp), len(got))
-	expSamples := slices.Clone(exp)
-	slices.Sort(expSamples)
-	median := expSamples[len(expSamples)/2]
+
+	minV := slices.Min(exp)
+	maxV := slices.Max(exp)
+
+	// Allow 10% of deviation from original.
 	const perc = 0.1
-	delta := int16(math.Abs(float64(median) * perc))
+	delta := int16(math.Abs(float64(maxV-minV) * perc))
 
 	hits := 0
-	for _, v := range got {
-		if v >= median-delta && v <= median+delta {
+
+	var minD, maxD int16 = math.MaxInt16, 0
+	for i, v := range got {
+		dv := v - exp[i]
+		if dv < 0 {
+			dv = -dv
+		}
+		if dv < delta {
 			hits++
 		}
+		minD = min(minD, dv)
+		maxD = max(maxD, dv)
 	}
+
+	// 90% of the samples should match.
 	const percHit = 0.90
-	expHit := int(float64(len(expSamples)) * percHit)
-	require.True(t, hits >= expHit, "min=%v, max=%v\ngot:\n%v", slices.Min(got), slices.Max(got), got)
+	expHit := int(float64(len(exp)) * percHit)
+	require.True(t, hits >= expHit, "%s: insufficient number of good samples: %v/%v\nminD=%v, maxD=%v, allowed=%v\nmin=%v, max=%v\nexp:\n%v\ngot:\n%v",
+		name,
+		hits, expHit,
+		minD, maxD, delta,
+		slices.Min(got), slices.Max(got),
+		exp, got,
+	)
 }
 
 func newMediaPair(t testing.TB, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
+	return newMediaPairWithAddr(t, newIP("1.1.1.1"), newIP("2.2.2.2"), opt1, opt2)
+}
+
+func newMediaPairWithAddr(t testing.TB, ip1, ip2 netip.Addr, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
 	if opt1 == nil {
 		opt1 = &MediaOptions{}
 	}
@@ -375,11 +454,13 @@ func newMediaPair(t testing.TB, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
 	}
 	c1, c2 := newUDPPipe()
 
-	opt1.IP = newIP("1.1.1.1")
+	codecs := defaultCodecs
+
+	opt1.IP = ip1
 	opt1.Ports = rtcconfig.PortRange{Start: 10000}
 	opt1.NoInputResample = true
 
-	opt2.IP = newIP("2.2.2.2")
+	opt2.IP = ip2
 	opt2.Ports = rtcconfig.PortRange{Start: 20000}
 
 	const rate = 16000
@@ -396,17 +477,17 @@ func newMediaPair(t testing.TB, opt1, opt2 *MediaOptions) (m1, m2 *MediaPort) {
 	require.NoError(t, err)
 	t.Cleanup(m2.Close)
 
-	offer, err := m1.NewOffer(sdp.EncryptionNone)
+	offer, err := m1.NewOffer(codecs, sdp.EncryptionNone)
 	require.NoError(t, err)
 	offerData, err := offer.SDP.Marshal()
 	require.NoError(t, err)
 
-	answer, mc2, err := m2.SetOffer(offerData, sdp.EncryptionNone)
+	answer, mc2, err := m2.SetOffer(offerData, codecs, sdp.EncryptionNone)
 	require.NoError(t, err)
 	answerData, err := answer.SDP.Marshal()
 	require.NoError(t, err)
 
-	mc1, _, err := m1.SetAnswer(offer, answerData, sdp.EncryptionNone)
+	mc1, _, err := m1.SetAnswer(offer, answerData, codecs, sdp.EncryptionNone)
 	require.NoError(t, err)
 
 	err = m1.SetConfig(mc1)
@@ -495,7 +576,7 @@ func TestMediaTimeout(t *testing.T) {
 		}
 	})
 
-	t.Run("reset timeout", func(t *testing.T) {
+	t.Run("reset timeout after media", func(t *testing.T) {
 		m1, m2 := newMediaPair(t, &MediaOptions{
 			MediaTimeoutInitial: initial,
 			MediaTimeout:        timeout,
@@ -515,12 +596,36 @@ func TestMediaTimeout(t *testing.T) {
 			}
 		}
 
+		// Once media has flowed, SetTimeout does not re-enter the initial window —
+		// the general timeout applies relative to the last received RTP packet.
+		// Last packet arrived at most timeout/2 ago, so the timeout should fire
+		// within ~timeout from now, well before initial would elapse.
+		m1.SetTimeout(initial, timeout)
+
+		select {
+		case <-time.After(timeout + dt):
+			t.Fatal("timeout didn't trigger")
+		case <-m1.Timeout():
+		}
+	})
+
+	t.Run("reset timeout before any media", func(t *testing.T) {
+		m1, _ := newMediaPair(t, &MediaOptions{
+			MediaTimeoutInitial: initial,
+			MediaTimeout:        timeout,
+		}, nil)
+		m1.EnableTimeout(true)
+
+		// No media has ever arrived. SetTimeout re-arms startTime, and since the
+		// port has never seen an RTP packet, the new initial window applies from
+		// the moment of the SetTimeout call.
+		time.Sleep(initial / 2)
 		m1.SetTimeout(initial, timeout)
 
 		targ := time.Now().Add(initial)
 		select {
 		case <-m1.Timeout():
-			t.Fatal("initial timeout ignored")
+			t.Fatal("initial timeout fired too early")
 		case <-time.After(initial / 2):
 		}
 
@@ -614,5 +719,34 @@ func TestSymmetricRTP(t *testing.T) {
 		curDstPtr := m1.port.dst.Load()
 		require.NotNil(t, curDstPtr)
 		require.Equal(t, newAddr, *curDstPtr)
+	})
+
+	t.Run("auto", func(t *testing.T) {
+		m1, m2 := newMediaPairWithAddr(t,
+			newIP("1.1.1.1"), newIP("10.10.10.10"),
+			&MediaOptions{IgnoreLocalAddrInSDP: true}, nil,
+		)
+		dstPtr := m1.port.dst.Load()
+		require.NotNil(t, dstPtr)
+		require.True(t, dstPtr.IsValid())
+		symmetric := m1.port.symmetric.Load()
+		require.True(t, symmetric)
+
+		c2 := m2.port.UDPConn.(*testUDPConn)
+		newAddr := netip.AddrPortFrom(newIP("3.3.3.3"), 9999)
+		c2.addr = newAddr
+
+		err := m2.GetAudioWriter().WriteSample(msdk.PCM16Sample{0, 0})
+		require.NoError(t, err)
+
+		select {
+		case <-m1.Received():
+		case <-time.After(time.Second):
+			t.Fatal("no media received")
+		}
+
+		curDstPtr := m1.port.dst.Load()
+		require.NotNil(t, curDstPtr)
+		require.Equal(t, newAddr.String(), curDstPtr.String())
 	})
 }

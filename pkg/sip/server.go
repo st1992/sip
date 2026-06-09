@@ -24,6 +24,7 @@ import (
 	"net"
 	"net/netip"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/frostbyte73/core"
@@ -81,9 +82,14 @@ type AuthInfo struct {
 	Result       AuthResult
 	ProjectID    string
 	TrunkID      string
-	Username     string
-	Password     string
+	Auth         InboundAuth
 	ProviderInfo *livekit.ProviderInfo
+}
+
+type InboundAuth struct {
+	Username string
+	Password string
+	Realm    string
 }
 
 type DispatchResult int
@@ -91,8 +97,9 @@ type DispatchResult int
 const (
 	DispatchAccept = DispatchResult(iota)
 	DispatchRequestPin
-	DispatchNoRuleReject // reject the call with an error
-	DispatchNoRuleDrop   // silently drop the call
+	DispatchNoRuleReject       // reject the call with an error
+	DispatchNoRuleDrop         // silently drop the call
+	DispatchServiceUnavailable // dispatch rule evaluation failed at the transport level
 )
 
 type CallDispatch struct {
@@ -109,7 +116,7 @@ type CallDispatch struct {
 	FeatureFlags        map[string]string
 	RingingTimeout      time.Duration
 	MaxCallDuration     time.Duration
-	MediaEncryption     livekit.SIPMediaEncryption
+	MediaConfig         *livekit.SIPMediaConfig
 }
 
 type CallIdentifier struct {
@@ -119,10 +126,14 @@ type CallIdentifier struct {
 	SipCallID string
 }
 
+type MediaProcessorOpts struct {
+	InputSampleRate int
+}
+
 type Handler interface {
 	GetAuthCredentials(ctx context.Context, call *rpc.SIPCall) (AuthInfo, error)
 	DispatchCall(ctx context.Context, info *CallInfo) CallDispatch
-	GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string, callID string) msdk.PCM16Processor
+	GetMediaProcessor(features []livekit.SIPFeature, featureFlags map[string]string, callID string, opts MediaProcessorOpts) msdk.PCM16Processor
 
 	RegisterTransferSIPParticipantTopic(sipCallId string) error
 	DeregisterTransferSIPParticipantTopic(sipCallId string)
@@ -148,6 +159,7 @@ type Server struct {
 	cmu                sync.RWMutex
 	byLocalTag         map[LocalTag]*inboundCall
 	provisionalInvites *expirable.LRU[[2]string, LocalTag]
+	rejectedInvites    *expirable.LRU[[2]string, rejectedInviteResponse]
 
 	infos struct {
 		sync.Mutex
@@ -166,8 +178,14 @@ type Server struct {
 }
 
 type inProgressInvite struct {
-	sipCallID string
-	challenge digest.Challenge
+	sipCallID    string
+	challenge    digest.Challenge
+	authResolved atomic.Bool
+}
+
+type rejectedInviteResponse struct {
+	status sip.StatusCode
+	reason string
 }
 
 type ServerOption func(s *Server)
@@ -200,6 +218,10 @@ func NewServer(region string, conf *config.Config, log logger.Logger, mon *stats
 		byLocalTag:         make(map[LocalTag]*inboundCall),
 		provisionalInvites: expirable.NewLRU[[2]string, LocalTag](maxCallCache, nil, callCacheTTL),
 		siprecSessions:     NewSiprecSessionStore(log),
+	}
+	// Initialize the rejected-invite replay cache unless explicitly disabled.
+	if !conf.DisableRejectedInviteCache {
+		s.rejectedInvites = expirable.NewLRU[[2]string, rejectedInviteResponse](maxCallCache, nil, callCacheTTL)
 	}
 	for _, option := range options {
 		option(s)
@@ -347,13 +369,14 @@ func (s *Server) Start(agent *sipgo.UserAgent, sc *ServiceConfig, tlsConf *tls.C
 }
 
 func (s *Server) Stop() {
+	ctx := context.Background()
 	s.closing.Break()
 	s.cmu.Lock()
 	calls := maps.Values(s.byLocalTag)
 	s.byLocalTag = make(map[LocalTag]*inboundCall)
 	s.cmu.Unlock()
 	for _, c := range calls {
-		_ = c.Close()
+		c.Shutdown(ctx)
 	}
 	if s.siprecSessions != nil {
 		s.siprecSessions.Clear()

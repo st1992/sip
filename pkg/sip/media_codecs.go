@@ -16,7 +16,91 @@ package sip
 
 // Register supported audio codecs
 import (
-	_ "github.com/livekit/media-sdk/dtmf"
-	_ "github.com/livekit/media-sdk/g711"
-	_ "github.com/livekit/media-sdk/g722"
+	"errors"
+	"fmt"
+	"time"
+
+	_ "github.com/livekit/media-sdk/all"
+	"github.com/livekit/media-sdk/amrwb"
+	"github.com/livekit/media-sdk/dtmf"
+	"github.com/livekit/media-sdk/g711"
+	"github.com/livekit/media-sdk/g722"
+	"github.com/livekit/media-sdk/sdp"
+
+	msdk "github.com/livekit/media-sdk"
+	"github.com/livekit/protocol/livekit"
 )
+
+var defaultCodecs = msdk.NewCodecSet()
+
+func init() {
+	defaultCodecs.SetEnabledMap(map[string]bool{
+		g711.ALawSDPNameAndRate: true,
+		g711.ULawSDPNameAndRate: true,
+		g722.SDPNameAndRate:     true,
+		amrwb.SDPNameAndRate:    false, // optional
+		dtmf.SDPNameAndRate:     true,
+	})
+}
+
+func newMediaConfig(m *livekit.SIPMediaConfig, defaultTimeout time.Duration) (*sipMediaConfig, error) {
+	enc, err := sdpEncryption(m.Encryption)
+	if err != nil {
+		return nil, err
+	}
+	s, err := codecSet(m)
+	if err != nil {
+		return nil, err
+	}
+
+	mediaTimeout := defaultTimeout
+	if m.MediaTimeout != nil && m.MediaTimeout.AsDuration() > 0 {
+		mediaTimeout = m.MediaTimeout.AsDuration()
+	}
+	return &sipMediaConfig{
+		Encryption:   enc,
+		Codecs:       s,
+		MediaTimeout: mediaTimeout,
+	}, nil
+}
+
+type sipMediaConfig struct {
+	Encryption   sdp.Encryption
+	Codecs       *msdk.CodecSet
+	MediaTimeout time.Duration
+}
+
+func codecSet(m *livekit.SIPMediaConfig) (*msdk.CodecSet, error) {
+	var s *msdk.CodecSet
+	if m.OnlyListedCodecs {
+		if len(m.Codecs) == 0 {
+			return nil, errors.New("no codecs specified")
+		}
+		s = msdk.NewCodecSet() // empty set
+	} else {
+		s = defaultCodecs.NewSet() // inherit from default
+	}
+	for _, codec := range m.Codecs {
+		name := codec.Name
+		if name == "" {
+			return nil, errors.New("no codec name specified")
+		}
+		rate := codec.Rate
+		if rate == 0 {
+			// Set default rate
+			switch name {
+			case g711.ALawSDPNameOnly, g711.ULawSDPNameOnly:
+				rate = 8000
+			case g722.SDPNameOnly:
+				rate = 8000 // actually 16000, it's a know bug in the spec
+			case amrwb.SDPNameOnly:
+				rate = 16000
+			default:
+				return nil, fmt.Errorf("sample rate not specified for codec: %q", name)
+			}
+		}
+		name = fmt.Sprintf("%s/%d", name, rate)
+		s.SetEnabled(name, true)
+	}
+	return s, nil
+}

@@ -46,6 +46,8 @@ import (
 const (
 	defaultMediaTimeout        = 15 * time.Second
 	defaultMediaTimeoutInitial = 30 * time.Second
+	dstChangePrintInterval     = 10 * 1000 * 1000 * 1000 // 10 seconds, in nanoseconds
+	srcChangePrintInterval     = dstChangePrintInterval
 )
 
 type PortStatsSnapshot struct {
@@ -198,18 +200,32 @@ type UDPConn interface {
 	WriteToUDPAddrPort(b []byte, addr netip.AddrPort) (int, error)
 }
 
-func newUDPConn(log logger.Logger, conn UDPConn, symmetricRTP bool) *udpConn {
-	return &udpConn{UDPConn: conn, log: log, stopped: make(chan struct{}), symmetricRTP: symmetricRTP}
+func newUDPConn(log logger.Logger, conn UDPConn, symmetric bool) *udpConn {
+	c := &udpConn{
+		UDPConn: conn,
+		log:     log,
+		stopped: make(chan struct{}),
+	}
+	c.symmetric.Store(symmetric)
+	return c
 }
 
 type udpConn struct {
 	UDPConn
-	stopping     core.Fuse
-	stopped      chan struct{}
-	log          logger.Logger
-	symmetricRTP bool
-	src          atomic.Pointer[netip.AddrPort]
-	dst          atomic.Pointer[netip.AddrPort]
+	stopping       core.Fuse
+	stopped        chan struct{}
+	log            logger.Logger
+	symmetric      atomic.Bool // send packets to the same address we receive them from
+	src            atomic.Pointer[netip.AddrPort]
+	dst            atomic.Pointer[netip.AddrPort]
+	srcChangeCount atomic.Uint64
+	dstChangeCount atomic.Uint64
+	lastSrcPrint   atomic.Int64
+	lastDstPrint   atomic.Int64
+}
+
+func (c *udpConn) SetSymmetric(enabled bool) {
+	c.symmetric.Store(enabled)
 }
 
 func (c *udpConn) GetSrc() (netip.AddrPort, bool) {
@@ -225,9 +241,14 @@ func (c *udpConn) SetDst(addr netip.AddrPort) {
 	if addr.IsValid() {
 		prev := c.dst.Swap(&addr)
 		if prev == nil || !prev.IsValid() {
-			c.log.Infow("setting media destination", "addr", addr.String())
+			c.log.Infow("setting media destination", "prev", prev, "addr", addr.String())
 		} else if *prev != addr {
-			c.log.Infow("changing media destination", "addr", addr.String())
+			changeCount := c.dstChangeCount.Add(1)
+			now := time.Now().UnixNano()
+			if now-c.lastDstPrint.Load() > dstChangePrintInterval {
+				c.lastDstPrint.Store(now)
+				c.log.Infow("changing media destination", "prev", (*prev).String(), "addr", addr.String(), "count", changeCount)
+			}
 		}
 	}
 }
@@ -236,11 +257,17 @@ func (c *udpConn) Read(b []byte) (n int, err error) {
 	n, addr, err := c.ReadFromUDPAddrPort(b)
 	prev := c.src.Swap(&addr)
 	if prev == nil || !prev.IsValid() {
-		c.log.Infow("setting media source", "addr", addr.String())
+		c.log.Infow("setting media source", "prev", prev, "addr", addr.String())
 	} else if *prev != addr {
-		c.log.Infow("changing media source", "addr", addr.String())
+		changeCount := c.srcChangeCount.Add(1)
+		now := time.Now().UnixNano()
+		if now-c.lastSrcPrint.Load() > srcChangePrintInterval {
+			c.lastSrcPrint.Store(now)
+			c.srcChangeCount.Add(1)
+			c.log.Infow("changing media source", "prev", (*prev).String(), "addr", addr.String(), "count", changeCount)
+		}
 	}
-	if c.symmetricRTP {
+	if c.symmetric.Load() {
 		dst := c.dst.Load()
 		if dst == nil || !dst.IsValid() || *dst != addr {
 			c.SetDst(addr)
@@ -305,16 +332,17 @@ type MediaConf struct {
 }
 
 type MediaOptions struct {
-	IP                  netip.Addr
-	Ports               rtcconfig.PortRange
-	MediaTimeoutInitial time.Duration
-	MediaTimeout        time.Duration
-	SymmetricRTP        bool
-	Stats               *PortStats
-	EnableJitterBuffer  bool
-	NoInputResample     bool
-	IgnorePreanswerData bool
-	LogSignalChanges    bool
+	IP                   netip.Addr
+	Ports                rtcconfig.PortRange
+	MediaTimeoutInitial  time.Duration
+	MediaTimeout         time.Duration
+	SymmetricRTP         bool
+	IgnoreLocalAddrInSDP bool // enable symmetric RTP if local IP is specified in SDP
+	Stats                *PortStats
+	EnableJitterBuffer   bool
+	NoInputResample      bool
+	IgnorePreanswerData  bool
+	LogSignalChanges     bool
 }
 
 func NewMediaPort(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor, opts *MediaOptions, sampleRate int) (*MediaPort, error) {
@@ -353,7 +381,7 @@ func NewMediaPortWith(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor,
 		mon:              mon,
 		externalIP:       opts.IP,
 		mediaTimeout:     mediaTimeout,
-		timeoutResetTick: make(chan time.Duration, 1),
+		timeoutKick:      make(chan struct{}, 1),
 		jitterEnabled:    opts.EnableJitterBuffer,
 		logSignalChanges: opts.LogSignalChanges,
 		port:             newUDPConn(log, conn, opts.SymmetricRTP),
@@ -366,7 +394,7 @@ func NewMediaPortWith(tid traceid.ID, log logger.Logger, mon *stats.CallMonitor,
 	}
 	p.timeoutInitial.Store(&opts.MediaTimeoutInitial)
 	p.timeoutGeneral.Store(&opts.MediaTimeout)
-	go p.timeoutLoop(tid, func() {
+	go p.timeoutLoop(func() {
 		close(mediaTimeout)
 	})
 	p.log.Debugw("listening for media on UDP", "port", p.Port())
@@ -383,9 +411,10 @@ type MediaPort struct {
 	port             *udpConn
 	mediaReceived    core.Fuse
 	packetCount      atomic.Uint64
+	lastPacketTime   atomic.Int64 // UnixNano of last RTP packet, 0 if none
 	mediaTimeout     <-chan struct{}
+	timeoutKick      chan struct{} // wakes timeoutLoop when the deadline may have changed
 	timeoutStart     atomic.Pointer[time.Time]
-	timeoutResetTick chan time.Duration
 	timeoutInitial   atomic.Pointer[time.Duration]
 	timeoutGeneral   atomic.Pointer[time.Duration]
 	closed           core.Fuse
@@ -416,9 +445,17 @@ func (p *MediaPort) EnableOut() {
 	p.audioOut.Enable()
 }
 
+func (p *MediaPort) kickTimeoutLoop() {
+	select {
+	case p.timeoutKick <- struct{}{}:
+	default: // already pending
+	}
+}
+
 func (p *MediaPort) disableTimeout() {
 	p.log.Debugw("media timeout disabled")
 	p.timeoutStart.Store(nil)
+	p.kickTimeoutLoop()
 }
 
 func (p *MediaPort) enableTimeout(initial, general time.Duration) {
@@ -433,10 +470,6 @@ func (p *MediaPort) enableTimeout(initial, general time.Duration) {
 	}
 	p.timeoutInitial.Store(&initial)
 	p.timeoutGeneral.Store(&general)
-	select {
-	case p.timeoutResetTick <- general:
-	default:
-	}
 	now := time.Now()
 	p.timeoutStart.Store(&now)
 	p.log.Debugw("media timeout enabled",
@@ -444,6 +477,7 @@ func (p *MediaPort) enableTimeout(initial, general time.Duration) {
 		"initial", initial,
 		"timeout", general,
 	)
+	p.kickTimeoutLoop()
 }
 
 func (p *MediaPort) EnableTimeout(enabled bool) {
@@ -458,100 +492,93 @@ func (p *MediaPort) SetTimeout(initial, general time.Duration) {
 	p.enableTimeout(initial, general)
 }
 
-func (p *MediaPort) timeoutLoop(tid traceid.ID, timeoutCallback func()) {
+func (p *MediaPort) timeoutLoop(timeoutCallback func()) {
 	defer p.log.Infow("media timeout loop stopped")
-	ticker := time.NewTicker(p.opts.MediaTimeout)
-	defer ticker.Stop()
 
-	var (
-		lastPackets  uint64
-		startPackets uint64
-		lastTime     time.Time
-		lastLog      = time.Now()
-	)
+	const disabledPark = time.Hour
+	timer := time.NewTimer(disabledPark)
+	defer timer.Stop()
+
+	lastLog := time.Now()
 	for {
 		select {
 		case <-p.closed.Watch():
 			return
-		case tick := <-p.timeoutResetTick:
-			ticker.Reset(tick)
-			startPackets = p.packetCount.Load()
-			lastTime = time.Now()
-			lastLog = lastTime
-			p.log.Infow("media timeout reset", "packets", startPackets, "tick", tick)
-		case <-ticker.C:
-			log := p.log
-			curPackets := p.packetCount.Load()
-			startPtr := p.timeoutStart.Load()
-			var startTime time.Time
-			if startPtr != nil {
-				startTime = *startPtr
-			}
-			verbose := false
-			if now := time.Now(); now.Sub(lastLog) > time.Hour {
-				verbose = true
-				lastLog = now
-				log = log.WithValues(
-					"startPackets", startPackets,
-					"packets", curPackets,
-					"lastPackets", lastPackets,
-					"sinceLast", time.Since(lastTime),
-					"sinceStart", time.Since(startTime),
-				)
-				if curPackets == startPackets {
-					log.Warnw("media timout is idle for a long time", nil)
-				} else {
-					log.Infow("media timeout stats")
-				}
-			}
-			if curPackets != lastPackets {
-				lastPackets = curPackets
-				lastTime = time.Now()
-				if verbose {
-					log.Infow("got a new packet")
-				}
-				continue // wait for the next tick
-			}
-			if startPtr == nil {
-				if verbose {
-					log.Infow("timeout is disabled")
-				}
-				continue // timeout disabled
-			}
-			isInitial := lastPackets == startPackets
-			sinceStart := time.Since(*startPtr)
-			sinceLast := time.Since(lastTime)
-			var (
-				since   time.Duration
-				timeout time.Duration
-			)
-			// First timeout could be different. Usually it's longer to allow for a call setup.
-			// In some cases it could be shorter (e.g. when we notice an issue with signaling and suspect media will fail).
-			if isInitial {
-				since = sinceStart
-				timeout = p.opts.MediaTimeoutInitial
-				if ptr := p.timeoutInitial.Load(); ptr != nil {
-					timeout = *ptr
-				}
-			} else {
-				since = sinceLast
-				timeout = p.opts.MediaTimeout
-				if ptr := p.timeoutGeneral.Load(); ptr != nil {
-					timeout = *ptr
-				}
-			}
+		case <-p.timeoutKick:
+		case <-timer.C:
+		}
 
-			// Ticker is allowed to fire earlier than the full timeout interval. Skip if it's not a full timeout yet.
-			if since+timeout/10 < timeout {
-				if verbose {
-					log.Infow("too early to trigger", "since", since, "timeout", timeout)
-				}
-				continue
+		verbose := false
+		if now := time.Now(); now.Sub(lastLog) > time.Hour {
+			verbose = true
+			lastLog = now
+		}
+
+		startPtr := p.timeoutStart.Load()
+		if startPtr == nil {
+			if verbose {
+				p.log.Infow("media timeout disabled", "packets", p.packetCount.Load())
 			}
+			timer.Reset(disabledPark)
+			continue
+		}
+		startTime := *startPtr
+
+		var lastPacketTime time.Time
+		if nano := p.lastPacketTime.Load(); nano > 0 {
+			lastPacketTime = time.Unix(0, nano)
+		}
+
+		generalTimeout := p.opts.MediaTimeout
+		if ptr := p.timeoutGeneral.Load(); ptr != nil {
+			generalTimeout = *ptr
+		}
+
+		// Initial mode: no media has ever been received on this port. Once a single
+		// RTP packet arrives, we switch to the general window regardless of any
+		// subsequent SetTimeout re-arming the startTime.
+		isInitial := lastPacketTime.IsZero()
+		var (
+			deadline time.Time
+			timeout  time.Duration
+		)
+		if isInitial {
+			timeout = p.opts.MediaTimeoutInitial
+			if ptr := p.timeoutInitial.Load(); ptr != nil {
+				timeout = *ptr
+			}
+			deadline = startTime.Add(timeout)
+		} else {
+			timeout = generalTimeout
+			deadline = lastPacketTime.Add(timeout)
+		}
+		remaining := time.Until(deadline)
+
+		var sinceLast time.Duration
+		if !lastPacketTime.IsZero() {
+			sinceLast = time.Since(lastPacketTime)
+		}
+
+		if verbose {
+			log := p.log.WithValues(
+				"packets", p.packetCount.Load(),
+				"sinceStart", time.Since(startTime),
+				"sinceLast", sinceLast,
+				"remaining", remaining,
+				"timeout", timeout,
+				"isInitial", isInitial,
+			)
+			if isInitial {
+				log.Warnw("media timeout is idle for a long time", nil)
+			} else {
+				log.Infow("media timeout stats")
+			}
+		}
+
+		if remaining <= 0 {
 			p.log.Infow("triggering media timeout",
-				"packets", lastPackets,
-				"startPackets", startPackets,
-				"sinceStart", sinceStart,
+				"packets", p.packetCount.Load(),
+				"sinceStart", time.Since(startTime),
 				"sinceLast", sinceLast,
 				"timeout", timeout,
 				"isInitial", isInitial,
@@ -559,6 +586,10 @@ func (p *MediaPort) timeoutLoop(tid traceid.ID, timeoutCallback func()) {
 			timeoutCallback()
 			return
 		}
+		// Cap the wake-up at the general timeout so packet arrivals during a long
+		// initial window get observed within one general interval, instead of
+		// having to wait out the full initial deadline.
+		timer.Reset(min(remaining, generalTimeout))
 	}
 }
 
@@ -612,6 +643,12 @@ func (p *MediaPort) Config() *MediaConf {
 	return p.conf
 }
 
+// InputSampleRate returns the expected sample rate for incoming audio from SIP.
+// Must be called after SetConfig, which sets the audioIn sample rate.
+func (p *MediaPort) InputSampleRate() int {
+	return p.audioIn.SampleRate()
+}
+
 // WriteAudioTo sets audio writer that will receive decoded PCM from incoming RTP packets.
 func (p *MediaPort) WriteAudioTo(w msdk.PCM16Writer) {
 	if processor := p.conf.Processor; processor != nil {
@@ -628,16 +665,16 @@ func (p *MediaPort) GetAudioWriter() msdk.PCM16Writer {
 }
 
 // NewOffer generates an SDP offer for the media.
-func (p *MediaPort) NewOffer(encrypted sdp.Encryption) (*sdp.Offer, error) {
-	return sdp.NewOffer(p.externalIP, p.Port(), encrypted)
+func (p *MediaPort) NewOffer(codecs *msdk.CodecSet, encrypted sdp.Encryption) (*sdp.Offer, error) {
+	return sdp.NewOfferWith(codecs, p.externalIP, p.Port(), encrypted)
 }
 
 // SetAnswer decodes and applies SDP answer for offer from NewOffer.
 // SetConfig must be called with the decoded configuration.
-func (p *MediaPort) SetAnswer(offer *sdp.Offer, answerData []byte, enc sdp.Encryption) (*MediaConf, []byte, error) {
-	answer, err := sdp.ParseAnswer(answerData)
+func (p *MediaPort) SetAnswer(offer *sdp.Offer, answerData []byte, codecs *msdk.CodecSet, enc sdp.Encryption) (*MediaConf, []byte, error) {
+	answer, err := sdp.ParseAnswerWith(codecs, answerData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, SDPError{Err: err}
 	}
 	mc, localSDP, err := answer.ApplyWithLocal(offer, enc)
 	if err != nil {
@@ -651,14 +688,14 @@ func (p *MediaPort) SetAnswer(offer *sdp.Offer, answerData []byte, enc sdp.Encry
 }
 
 // SetOffer decodes the offer from another party and returns encoded answer. To accept the offer, call SetConfig.
-func (p *MediaPort) SetOffer(offerData []byte, enc sdp.Encryption) (*sdp.Answer, *MediaConf, error) {
-	offer, err := sdp.ParseOffer(offerData)
+func (p *MediaPort) SetOffer(offerData []byte, codecs *msdk.CodecSet, enc sdp.Encryption) (*sdp.Answer, *MediaConf, error) {
+	offer, err := sdp.ParseOfferWith(codecs, offerData)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, SDPError{Err: err}
 	}
 	answer, mc, err := offer.Answer(p.externalIP, p.Port(), enc)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, SDPError{Err: err}
 	}
 	return answer, &MediaConf{MediaConfig: *mc}, nil
 }
@@ -677,7 +714,11 @@ func (p *MediaPort) SetConfig(c *MediaConf) error {
 		"srtp", crypto,
 	)
 
+	symmetric := p.opts.SymmetricRTP || (p.opts.IgnoreLocalAddrInSDP && c.Remote.Addr().IsPrivate())
 	p.port.SetDst(c.Remote)
+	if symmetric {
+		p.port.SetSymmetric(true)
+	}
 	if p.opts.IgnorePreanswerData {
 		// this needs to happen before the SRTP session is created, otherwise the read deadline will be
 		// overwritten and we may get stuck in the discard loop
@@ -688,7 +729,7 @@ func (p *MediaPort) SetConfig(c *MediaConf) error {
 		err  error
 	)
 	if c.Crypto != nil {
-		sess, err = srtp.NewSession(p.log, p.port, c.Crypto)
+		sess, err = srtp.NewSession(p.log, &srtpConn{Conn: p.port}, c.Crypto)
 	} else {
 		sess = rtp.NewSession(p.log, p.port)
 	}
@@ -698,7 +739,6 @@ func (p *MediaPort) SetConfig(c *MediaConf) error {
 
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	p.port.SetDst(c.Remote)
 	p.conf = c
 	p.sess = sess
 
@@ -746,6 +786,7 @@ func (p *MediaPort) rtpReadLoop(tid traceid.ID, log logger.Logger, r rtp.ReadStr
 			return
 		}
 		p.packetCount.Add(1)
+		p.lastPacketTime.Store(time.Now().UnixNano())
 		p.stats.Packets.Add(1)
 		if n > rtp.MTUSize {
 			if !overflow {
@@ -887,7 +928,7 @@ func (p *MediaPort) setupInput() {
 	if p.conf.Audio.DTMFType != 0 {
 		mux.Register(
 			p.conf.Audio.DTMFType, newRTPHandlerCount(
-				newRTPStatsHandler(p.mon, dtmf.SDPName, rtp.HandlerFunc(p.dtmfHandler)),
+				newRTPStatsHandler(p.mon, dtmf.SDPNameAndRate, rtp.HandlerFunc(p.dtmfHandler)),
 				&p.stats.DTMFPackets, &p.stats.DTMFBytes,
 			),
 		)

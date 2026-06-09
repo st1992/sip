@@ -16,12 +16,13 @@ package sip
 
 import (
 	"context"
-	"errors"
 	"io"
 	"math"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"errors"
 
 	"github.com/frostbyte73/core"
 	"github.com/pion/webrtc/v4"
@@ -146,8 +147,9 @@ type ParticipantInfo struct {
 
 // RoomInterface defines the interface for room operations
 type RoomInterface interface {
-	Connect(conf *config.Config, rconf RoomConfig) error
+	Connect(ctx context.Context, conf *config.Config, rconf RoomConfig) error
 	Closed() <-chan struct{}
+	ClosedReason() livekit.DisconnectReason
 	Subscribed() <-chan struct{}
 	Room() *lksdk.Room
 	Subscribe()
@@ -161,6 +163,7 @@ type RoomInterface interface {
 	NewParticipantTrack(sampleRate int) (msdk.WriteCloser[msdk.PCM16Sample], error)
 	SendData(data lksdk.DataPacket, opts ...lksdk.DataPublishOption) error
 	NewTrack() *mixer.Input
+	RegisterRPC(method string, handler lksdk.RpcHandlerFunc) error
 }
 
 type GetRoomFunc func(log logger.Logger, st *RoomStats) RoomInterface
@@ -243,6 +246,16 @@ func (r *Room) Closed() <-chan struct{} {
 	return r.stopped.Watch()
 }
 
+// ClosedReason returns the raw protocol disconnect reason once Closed() has
+// fired. Returns livekit.DisconnectReason_UNKNOWN_REASON if the room hasn't
+// disconnected or no reason was reported.
+func (r *Room) ClosedReason() livekit.DisconnectReason {
+	if r == nil || r.room == nil {
+		return livekit.DisconnectReason_UNKNOWN_REASON
+	}
+	return r.room.DisconnectReason()
+}
+
 func (r *Room) Subscribed() <-chan struct{} {
 	if r == nil {
 		return nil
@@ -289,7 +302,7 @@ func (r *Room) subscribeTo(pub *lksdk.RemoteTrackPublication, rp *lksdk.RemotePa
 	r.subscribed.Break()
 }
 
-func (r *Room) Connect(conf *config.Config, rconf RoomConfig) error {
+func (r *Room) Connect(ctx context.Context, conf *config.Config, rconf RoomConfig) error {
 	if rconf.WsUrl == "" {
 		rconf.WsUrl = conf.WsUrl
 	}
@@ -321,19 +334,19 @@ func (r *Room) Connect(conf *config.Config, rconf RoomConfig) error {
 				r.subscribeTo(pub, rp)
 			},
 			OnTrackSubscribed: func(track *webrtc.TrackRemote, pub *lksdk.RemoteTrackPublication, rp *lksdk.RemoteParticipant) {
-				log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", track.ID(), "trackName", pub.Name())
-				if !r.ready.IsBroken() {
-					log.Warnw("ignoring track, room not ready", nil)
-					return
-				}
-				log.Infow("mixing track")
-
 				go func() {
+					subscribedAt := time.Now().UnixMilli()
+					log := r.roomLog.WithValues("participant", rp.Identity(), "participantID", rp.SID(), "trackID", track.ID(), "trackName", pub.Name(), "subscribedAt", subscribedAt)
+					if !r.ready.IsBroken() {
+						log.Warnw("ignoring track, room not ready", nil)
+						return
+					}
+					defer func() { log.Infow("track closed", "closedAt", time.Now().UnixMilli()) }()
+
 					mTrack := r.NewTrack()
 					if mTrack == nil {
 						return // closed
 					}
-					defer log.Infow("track closed")
 					defer mTrack.Close()
 
 					var out msdk.PCM16Writer = mTrack
@@ -423,7 +436,7 @@ func (r *Room) Connect(conf *config.Config, rconf RoomConfig) error {
 	}
 	room := lksdk.NewRoom(roomCallback)
 	room.SetLogger(medialogutils.NewOverrideLogger(r.log))
-	err := room.JoinWithToken(rconf.WsUrl, rconf.Token,
+	err := room.JoinWithContextAndToken(ctx, rconf.WsUrl, rconf.Token,
 		lksdk.WithAutoSubscribe(false),
 		lksdk.WithExtraAttributes(partConf.Attributes),
 	)
@@ -441,6 +454,10 @@ func (r *Room) Connect(conf *config.Config, rconf RoomConfig) error {
 
 	// Not subscribing to any tracks just yet!
 	return nil
+}
+
+func (r *Room) RegisterRPC(method string, handler lksdk.RpcHandlerFunc) error {
+	return r.room.RegisterRpcMethod(method, handler)
 }
 
 func (r *Room) Subscribe() {

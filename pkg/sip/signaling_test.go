@@ -13,7 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/pkg/errors"
+	"errors"
+
 	"github.com/stretchr/testify/require"
 
 	"github.com/livekit/media-sdk/sdp"
@@ -369,7 +370,7 @@ func (d *sipUADialogTest) NewRequest(method sip.RequestMethod) *sip.Request {
 
 func (d *sipUADialogTest) Invite(offer []byte) (*sip.Request, []byte, error) {
 	if offer == nil {
-		sdpOffer, err := sdp.NewOffer(d.TestUA.localAddr.Addr(), 0xB0B, sdp.EncryptionNone)
+		sdpOffer, err := sdp.NewOfferWith(defaultCodecs, d.TestUA.localAddr.Addr(), 0xB0B, sdp.EncryptionNone)
 		if err != nil {
 			return nil, nil, err
 		}
@@ -401,8 +402,19 @@ type serviceTest struct {
 	Handler Handler
 }
 
-func NewServiceTest(t *testing.T) *serviceTest {
+type serviceTestConfig struct {
+	GetRoom GetRoomFunc
+}
+
+func NewServiceTest(t *testing.T, options *serviceTestConfig) *serviceTest {
 	t.Helper()
+
+	if options == nil {
+		options = &serviceTestConfig{}
+	}
+	if options.GetRoom == nil {
+		options.GetRoom = newTestRoomConfig(nil)
+	}
 
 	sipPort := rand.Intn(testPortSIPMax-testPortSIPMin) + testPortSIPMin
 	loopback := netip.MustParseAddr("127.0.0.1")
@@ -438,7 +450,7 @@ func NewServiceTest(t *testing.T) *serviceTest {
 		log,
 		mon,
 		func(projectID string) rpc.IOInfoClient { return &MockIOInfoClient{} },
-		WithGetRoomClient(newTestRoom),
+		WithGetRoomClient(options.GetRoom),
 	)
 	srv := NewServer(
 		"",
@@ -446,7 +458,7 @@ func NewServiceTest(t *testing.T) *serviceTest {
 		log,
 		mon,
 		func(projectID string) rpc.IOInfoClient { return &MockIOInfoClient{} },
-		WithGetRoomServer(newTestRoom),
+		WithGetRoomServer(options.GetRoom),
 		WithClient(cli),
 	)
 	require.NotNil(t, srv)
@@ -552,7 +564,7 @@ func (st *serviceTest) CreateOutboundCall(t *testing.T, opts ...createCallTestOp
 			opt(msg.req, nil) // Simulate added headers
 		}
 
-		offer, err := sdp.ParseOffer(msg.req.Body())
+		offer, err := sdp.ParseOfferWith(defaultCodecs, msg.req.Body())
 		require.NoError(t, err)
 		sdpAnswer, _, err := offer.Answer(netip.MustParseAddr("4.3.2.1"), 0xB00, sdp.EncryptionNone)
 		require.NoError(t, err)
@@ -596,7 +608,7 @@ func (st *serviceTest) CreateOutboundCall(t *testing.T, opts ...createCallTestOp
 func TestReinvite(t *testing.T) {
 	t.Run("inbound", func(t *testing.T) {
 		t.Run("normal", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			call, _ := st.CreateInboundCall(t)
 			serverLocalSDP := call.remoteSDP
 
@@ -608,7 +620,7 @@ func TestReinvite(t *testing.T) {
 			require.Equal(t, serverLocalSDP, resp.Body(), "reinvite 200 OK should return server local SDP")
 
 			// Re-INVITE with new offer
-			newOffer, err := sdp.NewOffer(netip.MustParseAddr("9.8.7.6"), 12345, sdp.EncryptionNone)
+			newOffer, err := sdp.NewOfferWith(defaultCodecs, netip.MustParseAddr("9.8.7.6"), 12345, sdp.EncryptionNone)
 			require.NoError(t, err)
 			newOfferBytes, err := newOffer.SDP.Marshal()
 			require.NoError(t, err)
@@ -620,7 +632,7 @@ func TestReinvite(t *testing.T) {
 		})
 
 		t.Run("miss", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			call, _ := st.CreateInboundCall(t)
 			serverLocalSDP := call.remoteSDP
 
@@ -642,7 +654,7 @@ func TestReinvite(t *testing.T) {
 	})
 	t.Run("outbound", func(t *testing.T) {
 		t.Run("normal", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			call, oc, _ := st.CreateOutboundCall(t)
 			serverLocalSDP := oc.cc.LocalSDP()
 			require.NotEqual(t, call.localSDP, serverLocalSDP, "local and remote SDP should be different")
@@ -655,7 +667,7 @@ func TestReinvite(t *testing.T) {
 			require.Equal(t, serverLocalSDP, resp.Body(), "reinvite 200 OK should return server local SDP")
 
 			// Re-INVITE with new offer
-			newOffer, err := sdp.NewOffer(netip.MustParseAddr("9.8.7.6"), 12345, sdp.EncryptionNone)
+			newOffer, err := sdp.NewOfferWith(defaultCodecs, netip.MustParseAddr("9.8.7.6"), 12345, sdp.EncryptionNone)
 			require.NoError(t, err)
 			newOfferBytes, err := newOffer.SDP.Marshal()
 			require.NoError(t, err)
@@ -667,7 +679,7 @@ func TestReinvite(t *testing.T) {
 		})
 
 		t.Run("miss", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			call, oc, _ := st.CreateOutboundCall(t)
 			serverLocalSDP := oc.cc.LocalSDP()
 
@@ -693,7 +705,7 @@ func TestTransfer(t *testing.T) {
 	t.Run("inbound", func(t *testing.T) {
 		prepFunc := func(t *testing.T) (*serviceTest, *sipUADialogTest, *inboundCall) {
 			t.Helper()
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			call, ic := st.CreateInboundCall(t)
 			return st, call, ic
 		}
@@ -825,7 +837,7 @@ func TestTransfer(t *testing.T) {
 	t.Run("outbound", func(t *testing.T) {
 		prepFunc := func(t *testing.T) (*serviceTest, *sipUADialogTest, *outboundCall) {
 			t.Helper()
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			call, oc, _ := st.CreateOutboundCall(t)
 			return st, call, oc
 		}
@@ -1000,7 +1012,7 @@ func TestRouteSet(t *testing.T) {
 		// Server is UAS for inbound calls. Route set should be in order.
 
 		t.Run("BYE", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			rrHeaders, expectUAS, _ := makeRouteSetHeaders(t, st)
 			call, ic := st.CreateInboundCall(t, withTestHeaders(rrHeaders...))
 
@@ -1032,7 +1044,7 @@ func TestRouteSet(t *testing.T) {
 		})
 
 		t.Run("REFER", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			rrHeaders, expectUAS, _ := makeRouteSetHeaders(t, st)
 			call, ic := st.CreateInboundCall(t, withTestHeaders(rrHeaders...))
 			t.Cleanup(func() { ic.Close() })
@@ -1077,7 +1089,7 @@ func TestRouteSet(t *testing.T) {
 		// Server is UAC for outbound calls. Route set should be reversed.
 
 		t.Run("ACK", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			rrHeaders, _, expectUAC := makeRouteSetHeaders(t, st)
 			call, _, ackReq := st.CreateOutboundCall(t, withTestHeaders(rrHeaders...))
 			assertRouteHeaders(t, ackReq, expectUAC)
@@ -1088,7 +1100,7 @@ func TestRouteSet(t *testing.T) {
 		})
 
 		t.Run("BYE", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			rrHeaders, _, expectUAC := makeRouteSetHeaders(t, st)
 			call, oc, _ := st.CreateOutboundCall(t, withTestHeaders(rrHeaders...))
 
@@ -1118,7 +1130,7 @@ func TestRouteSet(t *testing.T) {
 		})
 
 		t.Run("REFER", func(t *testing.T) {
-			st := NewServiceTest(t)
+			st := NewServiceTest(t, nil)
 			rrHeaders, _, expectUAC := makeRouteSetHeaders(t, st)
 			call, oc, _ := st.CreateOutboundCall(t, withTestHeaders(rrHeaders...))
 

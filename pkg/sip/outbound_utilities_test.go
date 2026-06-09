@@ -104,8 +104,21 @@ type testRoom struct {
 	room *Room
 }
 
+type testRoomConfig struct {
+	ringForever bool
+}
+
+func newTestRoomConfig(cfg *testRoomConfig) GetRoomFunc {
+	return func(log logger.Logger, st *RoomStats) RoomInterface {
+		return newTestRoomWithConfig(log, st, cfg)
+	}
+}
+
 // newTestRoom creates a Room that skips actual LiveKit connection
-func newTestRoom(log logger.Logger, st *RoomStats) RoomInterface {
+func newTestRoomWithConfig(log logger.Logger, st *RoomStats, cfg *testRoomConfig) RoomInterface {
+	if cfg == nil {
+		cfg = &testRoomConfig{}
+	}
 	if st == nil {
 		st = &RoomStats{}
 	}
@@ -132,7 +145,9 @@ func newTestRoom(log logger.Logger, st *RoomStats) RoomInterface {
 
 	// Set ready immediately (skip connection)
 	room.ready.Break()
-	room.subscribed.Break()
+	if !cfg.ringForever {
+		room.subscribed.Break()
+	}
 	resolve.Resolve()
 
 	room.room.OnRoomUpdate(&livekit.Room{ // Set metadata, and specifically Sid
@@ -155,7 +170,7 @@ func newTestRoom(log logger.Logger, st *RoomStats) RoomInterface {
 }
 
 // Connect overrides Room.Connect to skip actual LiveKit connection
-func (r *testRoom) Connect(conf *config.Config, rconf RoomConfig) error {
+func (r *testRoom) Connect(_ context.Context, conf *config.Config, rconf RoomConfig) error {
 	// Update participant info from config
 	partConf := rconf.Participant
 	r.room.p = ParticipantInfo{
@@ -170,6 +185,10 @@ func (r *testRoom) Connect(conf *config.Config, rconf RoomConfig) error {
 // All other methods delegate to the embedded Room
 func (r *testRoom) Closed() <-chan struct{} {
 	return r.room.Closed()
+}
+
+func (r *testRoom) ClosedReason() livekit.DisconnectReason {
+	return r.room.ClosedReason()
 }
 
 func (r *testRoom) Subscribed() <-chan struct{} {
@@ -246,7 +265,12 @@ func (r *testRoom) NewTrack() *mixer.Input {
 	return r.room.NewTrack()
 }
 
+func (r *testRoom) RegisterRPC(method string, handler lksdk.RpcHandlerFunc) error {
+	return r.room.RegisterRPC(method, handler)
+}
+
 type testSIPClientTransaction struct {
+	log       logger.Logger
 	responses chan *sip.Response
 	cancels   chan struct{}
 	done      chan struct{}
@@ -254,7 +278,7 @@ type testSIPClientTransaction struct {
 }
 
 func (t *testSIPClientTransaction) Terminate() {
-	fmt.Println("Terminating transaction!!")
+	t.log.Infow("Terminating transaction %v", t)
 	if t.responses != nil {
 		close(t.responses)
 		t.responses = nil
@@ -298,7 +322,7 @@ func (t *testSIPClientTransaction) Cancel() error {
 }
 
 func (t *testSIPClientTransaction) SendResponse(resp *sip.Response) error {
-	fmt.Printf("SIP Response sent on transaction %v:\n%s\n", t, resp.String())
+	t.log.Infow("SIP Response sent on transaction %v:\n%s\n", t, resp.String())
 	select {
 	case t.responses <- resp:
 		return nil
@@ -324,6 +348,7 @@ type sipRequest struct {
 // Works by mocking SIPClient interface, and providing tests with channels to listen for messages on.
 // An interface mirroring sipgo.Client to be able to mock it in tests.
 type testSIPClient struct {
+	log          logger.Logger
 	client       *sipgo.Client
 	requests     chan *sipRequest
 	transactions chan *transactionRequest
@@ -367,10 +392,11 @@ func (w *testSIPClient) TransactionRequest(req *sip.Request, options ...sipgo.Cl
 	if len(options) > 0 {
 		panic("options not supported for testSIPClient")
 	}
-	fmt.Printf("SIP TransactionRequest sent on client %v:\n%s\n", w, req.String())
+	w.log.Infow("SIP TransactionRequest sent on client %v:\n%s\n", w, req.String())
 	w.FillRequestBlanks(req)
 	w.sequence++
 	tx := &testSIPClientTransaction{
+		log:       w.log,
 		responses: make(chan *sip.Response),
 		cancels:   make(chan struct{}),
 		done:      make(chan struct{}),
@@ -422,22 +448,25 @@ func (w *testSIPClient) Close() error {
 
 var createdClients = make(chan *testSIPClient, 10)
 
-func NewTestClientFunc(ua *sipgo.UserAgent, options ...sipgo.ClientOption) (SIPClient, error) {
-	client, err := sipgo.NewClient(ua, options...)
-	if err != nil {
-		return nil, err
-	}
-	testClient := &testSIPClient{
-		client:       client,
-		requests:     make(chan *sipRequest, 10),         // Buffered to avoid blocking
-		transactions: make(chan *transactionRequest, 10), // Buffered to avoid blocking
-	}
+func NewTestClientFunc(log logger.Logger) GetSipClientFunc {
+	return func(ua *sipgo.UserAgent, options ...sipgo.ClientOption) (SIPClient, error) {
+		client, err := sipgo.NewClient(ua, options...)
+		if err != nil {
+			return nil, err
+		}
+		testClient := &testSIPClient{
+			log:          log,
+			client:       client,
+			requests:     make(chan *sipRequest, 10),         // Buffered to avoid blocking
+			transactions: make(chan *transactionRequest, 10), // Buffered to avoid blocking
+		}
 
-	select {
-	case createdClients <- testClient:
-		return testClient, nil
-	default:
-		return nil, errors.New("failed to add test client")
+		select {
+		case createdClients <- testClient:
+			return testClient, nil
+		default:
+			return nil, errors.New("failed to add test client")
+		}
 	}
 }
 
@@ -455,13 +484,7 @@ func NewOutboundTestClient(t testing.TB, cfg TestClientConfig) *Client {
 	if cfg.Region == "" {
 		cfg.Region = "test"
 	}
-	zlogger, err := logger.NewZapLogger(&logger.Config{
-		Level: "debug",
-		JSON:  false, // Use console format, not JSON
-	})
-	if err != nil {
-		t.Fatalf("failed to create logger: %v", err)
-	}
+	log := logger.NewTestLogger(t)
 	if cfg.Config == nil {
 		localIP, err := config.GetLocalIP()
 		if err != nil {
@@ -509,12 +532,12 @@ func NewOutboundTestClient(t testing.TB, cfg TestClientConfig) *Client {
 		}
 	}
 	if cfg.GetSipClient == nil {
-		cfg.GetSipClient = NewTestClientFunc
+		cfg.GetSipClient = NewTestClientFunc(log)
 	}
 	if cfg.GetRoom == nil {
-		cfg.GetRoom = newTestRoom
+		cfg.GetRoom = newTestRoomConfig(nil)
 	}
-	client := NewClient(cfg.Region, cfg.Config, zlogger, cfg.Monitor, cfg.GetIOClient, WithGetSipClient(cfg.GetSipClient), WithGetRoomClient(cfg.GetRoom))
+	client := NewClient(cfg.Region, cfg.Config, log, cfg.Monitor, cfg.GetIOClient, WithGetSipClient(cfg.GetSipClient), WithGetRoomClient(cfg.GetRoom))
 	client.SetHandler(&TestHandler{})
 
 	// Set up service config with minimal values
