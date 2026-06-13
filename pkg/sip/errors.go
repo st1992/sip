@@ -70,6 +70,33 @@ func (e SDPError) ClassifyInvite() inviteFailure {
 	return res
 }
 
+// transactionTimeoutError is an INVITE transaction that terminated without a
+// final response. responses = 1xx provisionals seen first: 0 = upstream went
+// silent (Timer B), >0 = answered but never completed.
+type transactionTimeoutError struct {
+	responses int
+}
+
+var _ inviteClassifier = transactionTimeoutError{}
+
+func (e transactionTimeoutError) Error() string {
+	return fmt.Sprintf("transaction failed to complete (%d intermediate responses)", e.responses)
+}
+
+func (e transactionTimeoutError) ClassifyInvite() inviteFailure {
+	reason := "upstream-no-response"
+	if e.responses > 0 {
+		reason = "no-final-response"
+	}
+	return inviteFailure{
+		status:    callUnavailable,
+		term:      stats.ClientError(reason),
+		reason:    livekit.DisconnectReason_SIP_TRUNK_FAILURE,
+		reportErr: e, // keep so the customer sees their destination didn't complete
+		returnErr: psrpc.NewError(psrpc.Canceled, e),
+	}
+}
+
 // classifyInviteError buckets an outbound INVITE error. Self-classifying
 // errors describe themselves; the residual switch covers external types we
 // can't extend (SIPStatus, net.*, context.*) and falls back to
@@ -129,8 +156,8 @@ func classifyInviteError(err error) inviteFailure {
 					res.status, res.term, res.reason = callRejected, stats.ClientError("concurrent-limit-exceeded"), livekit.DisconnectReason_SIP_TRUNK_FAILURE
 					// keep reportErr so the customer can see they hit their cap
 				default:
-					res.status, res.term, res.reason = callDropped, stats.ServerError(fmt.Sprintf("upstream-server-error-%d", code)), livekit.DisconnectReason_SIP_TRUNK_FAILURE
-					// keep reportErr so 5xx detail is recorded
+					// Carrier-side 5xx; keep reportErr for the detail.
+					res.status, res.term, res.reason = callDropped, stats.UpstreamError(fmt.Sprintf("upstream-server-error-%d", code)), livekit.DisconnectReason_SIP_TRUNK_FAILURE
 				}
 			case code >= 600 && code < 700:
 				res.status, res.term, res.reason = callRejected, stats.ClientError(fmt.Sprintf("global-decline-%d", code)), livekit.DisconnectReason_USER_REJECTED

@@ -9,11 +9,11 @@ require (
 	github.com/icholy/digest v1.1.0
 	github.com/jfreymuth/oggvorbis v1.0.5
 	github.com/livekit/mageutil v0.0.0-20250511045019-0f1ff63f7731
-	github.com/livekit/media-sdk v0.0.0-20260608145339-9568191731be
+	github.com/livekit/media-sdk v0.0.0-20260612175532-3d4d26d136c9
 	github.com/livekit/mediatransportutil v0.0.0-20260608063931-a3417d38cda0
-	github.com/livekit/protocol v1.46.7-0.20260605212020-c0615a2f6f84
+	github.com/livekit/protocol v1.46.7-0.20260610064410-e286afe70eb0
 	github.com/livekit/psrpc v0.7.2
-	github.com/livekit/server-sdk-go/v2 v2.16.6
+	github.com/livekit/server-sdk-go/v2 v2.16.7-0.20260608025623-a5da15b13baa
 	github.com/livekit/sipgo v0.13.2-0.20260519205735-a5b4a38b6ceb
 	github.com/mjibson/go-dsp v0.0.0-20180508042940-11479a337f12
 	github.com/ory/dockertest/v3 v3.12.0
@@ -78,7 +78,7 @@ require (
 	github.com/klauspost/compress v1.18.6 // indirect
 	github.com/klauspost/cpuid/v2 v2.3.0 // indirect
 	github.com/lithammer/shortuuid/v4 v4.2.0 // indirect
-	github.com/livekit/amrwb-cgo v0.0.0-20260527094629-96c39974d532 // indirect
+	github.com/livekit/amrwb-cgo v0.0.0-20260612153743-6d4b69dc1470 // indirect
 	github.com/mackerelio/go-osstat v0.2.7 // indirect
 	github.com/magefile/mage v1.17.2 // indirect
 	github.com/moby/docker-image-spec v1.3.1 // indirect
